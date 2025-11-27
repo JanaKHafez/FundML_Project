@@ -270,13 +270,15 @@ import scipy.sparse
 df_cleaned = df.copy()
 df_cleaned["cleaned_content"] = df["cleaned_content"]
 
-output_cleaned_path = "C:\\Users\\janak\\FundML_DataDump\\cleaned_hate_speech_dataset.csv"
+ROOT = "/home/janhaf2n/fundML_Project/"
+
+output_cleaned_path = os.path.join(ROOT, "cleaned_hate_speech_dataset.csv")
 df_cleaned.to_csv(output_cleaned_path, index=False)
 print(f"Cleaned dataset saved to: {output_cleaned_path}")
 
 # Save TF-IDF sparse matrix and feature names
-output_tfidf_matrix = "C:\\Users\\janak\\FundML_DataDump\\tfidf_matrix.npz"
-output_tfidf_features = "C:\\Users\\janak\\FundML_DataDump\\tfidf_features.txt"
+output_tfidf_matrix = os.path.join(ROOT, "tfidf_matrix.npz")
+output_tfidf_features = os.path.join(ROOT, "tfidf_features.txt")
 scipy.sparse.save_npz(output_tfidf_matrix, X_tfidf)
 with open(output_tfidf_features, "w", encoding="utf-8") as f:
     for feat in tfidf_vectorizer.get_feature_names_out():
@@ -285,8 +287,8 @@ print(f"TF-IDF matrix saved to: {output_tfidf_matrix}")
 print(f"TF-IDF feature names saved to: {output_tfidf_features}")
 
 # Save BoW sparse matrix and feature names
-output_bow_matrix = "C:\\Users\\janak\\FundML_DataDump\\bow_matrix.npz"
-output_bow_features = "C:\\Users\\janak\\FundML_DataDump\\bow_features.txt"
+output_bow_matrix = os.path.join(ROOT, "bow_matrix.npz")
+output_bow_features = os.path.join(ROOT, "bow_features.txt")
 scipy.sparse.save_npz(output_bow_matrix, X_bow)
 with open(output_bow_features, "w", encoding="utf-8") as f:
     for feat in bow_vectorizer.get_feature_names_out():
