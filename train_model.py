@@ -13,6 +13,8 @@ from nltk.stem import PorterStemmer
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, TensorDataset
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
 
 # ---------------- Config ----------------
 ROOT = "/home/janhaf2n/fundML_Project/"
@@ -23,7 +25,7 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 BATCH_SIZE = 256
-EPOCHS = 10
+EPOCHS = 20
 LEARNING_RATE = 1e-3
 EMBEDDING_SIZE = 512
 H1, H2 = 128, 64
@@ -94,19 +96,47 @@ num_neg, num_pos = np.bincount(y_train)
 pos_weight = float(num_neg) / max(1.0, float(num_pos))
 print(f"[4/5] Train/Test split done. Train size: {X_train_sp.shape[0]}, Test size: {X_test_sp.shape[0]}")
 
-# ---------------- PyTorch Model ----------------
-class HateSpeechNN(nn.Module):
-    def __init__(self, input_size, embedding_size=EMBEDDING_SIZE, h1=H1, h2=H2):
+# ---------------- PyTorch Lightning Model ----------------
+class HateSpeechNN(pl.LightningModule):
+    def __init__(self, input_size, embedding_size=EMBEDDING_SIZE, h1=H1, h2=H2, pos_weight=1.0, lr=LEARNING_RATE):
         super().__init__()
+        self.save_hyperparameters()
+        # Same architecture as before
         self.embedding = nn.Linear(input_size, embedding_size)
         self.hidden1 = nn.Linear(embedding_size, h1)
         self.hidden2 = nn.Linear(h1, h2)
         self.output = nn.Linear(h2, 1)
         self.relu = nn.ReLU()
+        self.criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight))
+        self.lr = lr
+        
     def forward(self, x):
         x = self.relu(self.hidden1(self.embedding(x)))
         x = self.relu(self.hidden2(x))
         return self.output(x).squeeze(1)
+    
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self(x)
+        loss = self.criterion(logits, y)
+        preds = (torch.sigmoid(logits) > 0.5).float()
+        acc = (preds == y).float().mean()
+        self.log('train_loss', loss, prog_bar=True)
+        self.log('train_acc', acc, prog_bar=True)
+        return loss
+    
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self(x)
+        loss = self.criterion(logits, y)
+        preds = (torch.sigmoid(logits) > 0.5).float()
+        acc = (preds == y).float().mean()
+        self.log('val_loss', loss, prog_bar=True)
+        self.log('val_acc', acc, prog_bar=True)
+        return {'preds': preds, 'labels': y}
+    
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.lr)
 
 # ---------------- Dataset ----------------
 try:
@@ -123,82 +153,42 @@ except MemoryError:
     train_dataset = SparseDataset(X_train_sp, y_train)
     test_dataset = SparseDataset(X_test_sp, y_test)
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=15)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=15)
 
-# ---------------- Model, Loss, Optimizer ----------------
+# ---------------- Model & Trainer ----------------
 input_size = X_tfidf.shape[1]
-model = HateSpeechNN(input_size=input_size).to(DEVICE)
-criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=DEVICE))
-optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+model = HateSpeechNN(input_size=input_size, pos_weight=pos_weight, lr=LEARNING_RATE)
 
-# ---------------- Training & Evaluation ----------------
-def train_one_epoch(model, loader, optimizer, criterion, device):
-    model.train()
-    loss_total = 0.0
-    preds, labels = [], []
+# Setup PyTorch Lightning trainer
+trainer = pl.Trainer(
+    max_epochs=EPOCHS,
+    accelerator='auto',
+    devices=1,
+    enable_progress_bar=True,
+    enable_model_summary=True,
+    deterministic=True
+)
 
-    for i, (xb, yb) in enumerate(loader, 1):
-        # Move to device and ensure float32
-        xb, yb = xb.to(device).float(), yb.to(device).float()
+# ---------------- Training ----------------
+print("[5/5] Starting training with PyTorch Lightning...")
+trainer.fit(model, train_loader, test_loader)
 
-        optimizer.zero_grad()
+# ---------------- Evaluation ----------------
+print("Evaluating model...")
+model.eval()
+model = model.to(DEVICE)
+y_true_all, y_pred_all = [], []
+with torch.no_grad():
+    for xb, yb in test_loader:
+        xb = xb.to(DEVICE).float()
+        yb = yb.to(DEVICE).float()
         logits = model(xb)
-        loss = criterion(logits, yb)
-        loss.backward()
-        optimizer.step()
-
-        loss_total += loss.item() * xb.size(0)
-
-        # Detach before converting to numpy
-        pred = (torch.sigmoid(logits).detach().cpu().numpy() > 0.5).astype(int)
-        preds.append(pred)
-        labels.append(yb.detach().cpu().numpy().astype(int))
-
-        if i % 10 == 0 or i == len(loader):
-            print(f"  Batch {i}/{len(loader)} completed")
-
-    avg_loss = loss_total / len(loader.dataset)
-    accuracy = accuracy_score(np.concatenate(labels), np.concatenate(preds))
-    return avg_loss, accuracy
-
-
-def evaluate(model, loader, criterion, device):
-    model.eval()
-    loss_total = 0.0
-    preds, labels = [], []
-
-    with torch.no_grad():
-        for i, (xb, yb) in enumerate(loader, 1):
-            # Move to device and ensure float32
-            xb, yb = xb.to(device).float(), yb.to(device).float()
-            logits = model(xb)
-            loss_total += criterion(logits, yb).item() * xb.size(0)
-
-            # Detach before converting to numpy
-            pred = (torch.sigmoid(logits).detach().cpu().numpy() > 0.5).astype(int)
-            preds.append(pred)
-            labels.append(yb.detach().cpu().numpy().astype(int))
-
-            if i % 10 == 0 or i == len(loader):
-                print(f"  Eval batch {i}/{len(loader)} completed")
-
-    avg_loss = loss_total / len(loader.dataset)
-    labels_all = np.concatenate(labels)
-    preds_all = np.concatenate(preds)
-    accuracy = accuracy_score(labels_all, preds_all)
-    return avg_loss, accuracy, labels_all, preds_all
-
-history = {"train_loss":[], "train_acc":[], "val_loss":[], "val_acc":[]}
-print("[5/5] Starting training...")
-for epoch in range(1, EPOCHS+1):
-    t0 = time.time()
-    print(f"Epoch {epoch}/{EPOCHS}...")
-    train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, DEVICE)
-    val_loss, val_acc, y_true_all, y_pred_all = evaluate(model, test_loader, criterion, DEVICE)
-    history["train_loss"].append(train_loss); history["train_acc"].append(train_acc)
-    history["val_loss"].append(val_loss); history["val_acc"].append(val_acc)
-    print(f"Epoch {epoch} completed: train_loss={train_loss:.4f}, train_acc={train_acc:.4f}, val_loss={val_loss:.4f}, val_acc={val_acc:.4f}, time={time.time()-t0:.2f}s\n")
+        preds = (torch.sigmoid(logits).cpu().numpy() > 0.5).astype(int)
+        y_pred_all.append(preds)
+        y_true_all.append(yb.cpu().numpy().astype(int))
+y_true_all = np.concatenate(y_true_all)
+y_pred_all = np.concatenate(y_pred_all)
 
 # ---------------- Metrics ----------------
 accuracy = accuracy_score(y_true_all, y_pred_all)
@@ -215,8 +205,7 @@ torch.save({
     "input_size": input_size,
     "embedding_size": EMBEDDING_SIZE,
     "hidden1_size": H1, "hidden2_size": H2,
-    "pos_weight": pos_weight,
-    "history": history
+    "pos_weight": pos_weight
 }, os.path.join(OUTPUT_DIR,"hate_speech_model.pt"))
 with open(os.path.join(OUTPUT_DIR,"tfidf_vectorizer.pkl"),"wb") as f: pickle.dump(tfidf,f)
 with open(os.path.join(OUTPUT_DIR,"model_metrics.txt"),"w") as f:
