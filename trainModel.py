@@ -1,3 +1,8 @@
+"""
+This file essentially does the same thing as trainModel_clean.py 
+but has additional features to speed up computation.
+"""
+
 import os, re, pickle, time
 import numpy as np
 import pandas as pd

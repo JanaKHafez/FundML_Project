@@ -1,3 +1,7 @@
+"""
+This file implements a clean version of the model training without additional optimizations.
+"""
+
 import os, re, pickle, time
 import numpy as np
 import pandas as pd
