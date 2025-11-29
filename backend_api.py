@@ -1,11 +1,3 @@
-"""
-Flask Backend API for Hate Speech Detection (PyTorch Version)
-Provides endpoints for:
-- Health check
-- Prediction
-- Feedback submission for online learning
-"""
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pickle
@@ -23,7 +15,8 @@ from torch.utils.data import TensorDataset, DataLoader
 app = Flask(__name__)
 CORS(app)  # Enable CORS for Streamlit frontend
 
-ROOT = "/home/janhaf2n/fundML_Project/"
+ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(ROOT)
 OUTPUT_DIR = os.path.join(ROOT, "Output")
 FEEDBACK_FILE = os.path.join(ROOT, "user_feedback.csv")
 RETRAIN_INTERVAL = 3600  # Retrain every hour
@@ -33,9 +26,8 @@ model = None
 tfidf_vectorizer = None
 cleaning_components = None
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model_meta = {} # To store input_size, pos_weight, etc.
+model_meta = {}
 
-# ----------------- Model Definition (Must match training script) -----------------
 class HateSpeechNN(nn.Module):
     def __init__(self, input_size, embedding_size=512, h1=128, h2=64):
         super().__init__()
@@ -44,62 +36,17 @@ class HateSpeechNN(nn.Module):
         self.hidden2 = nn.Linear(h1, h2)
         self.output = nn.Linear(h2, 1)
         self.relu = nn.ReLU()
-        
+
     def forward(self, x):
         x = self.relu(self.hidden1(self.embedding(x)))
         x = self.relu(self.hidden2(x))
         return self.output(x).squeeze(1)
-# ---------------------------------------------------------------------------------
 
-def load_model_and_artifacts():
-    """Load PyTorch model and preprocessing artifacts."""
-    global model, tfidf_vectorizer, cleaning_components, model_meta
-    
-    print(f"Loading model and artifacts on {device}...")
-    
-    try:
-        # 1. Load TF-IDF vectorizer (Pickle)
-        vectorizer_path = os.path.join(OUTPUT_DIR, 'tfidf_vectorizer.pkl')
-        with open(vectorizer_path, 'rb') as f:
-            tfidf_vectorizer = pickle.load(f)
-
-        # 2. Load PyTorch Model Checkpoint
-        model_path = os.path.join(OUTPUT_DIR, 'hate_speech_model.pt')
-        checkpoint = torch.load(model_path, map_location=device)
-        
-        # Extract metadata
-        input_size = checkpoint.get('input_size', len(tfidf_vectorizer.vocabulary_))
-        model_meta['pos_weight'] = checkpoint.get('pos_weight', 1.0)
-        
-        # Initialize and load model
-        model = HateSpeechNN(input_size=input_size)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.to(device)
-        model.eval()  # Set to evaluation mode
-
-        # 3. Load text processing components
-        text_processor_path = os.path.join(OUTPUT_DIR, 'text_processor.pkl')
-        with open(text_processor_path, 'rb') as f:
-            text_processor = pickle.load(f)
-            cleaning_components = {
-                'stemmer': text_processor['stemmer'],
-                'stop_words': text_processor['stop_words']
-            }
-        
-        print("Model and artifacts loaded successfully!")
-        return True
-    except Exception as e:
-        print(f"Error loading artifacts: {e}")
-        return False
-
-def clean_text(text):
-    """Clean and preprocess text using the same pipeline as training."""
+def clean_text(text):        
     if cleaning_components is None:
-        return str(text) # Fallback if not loaded
-        
+        return text
     stemmer = cleaning_components['stemmer']
     stop_words = cleaning_components['stop_words']
-    
     # Ensure it's a string
     text = str(text).lower()
     # Remove URLs
@@ -108,7 +55,6 @@ def clean_text(text):
     text = re.sub(r"[^a-z\s]", '', text)
     # Tokenize
     tokens = text.split()
-    
     # Remove empty or stop words and apply stemming
     cleaned_tokens = []
     for w in tokens:
@@ -120,6 +66,54 @@ def clean_text(text):
                 continue
     
     return " ".join(cleaned_tokens)
+
+def load():
+    global model, tfidf_vectorizer, cleaning_components, model_meta
+
+    print(f"Loading model and artifacts on {device}...")
+
+    try:
+        # 1. Load TF-IDF vectorizer
+        vectorizer_path = os.path.join(OUTPUT_DIR, 'tfidf_vectorizer.pkl')
+        with open(vectorizer_path, 'rb') as f:
+            tfidf_vectorizer = pickle.load(f)
+
+        # 2. Load PyTorch Model Checkpoint
+        model_path = os.path.join(OUTPUT_DIR, 'hate_speech_model.pt')
+        checkpoint = torch.load(model_path, map_location=device)
+
+        # Extract metadata
+        input_size = checkpoint.get('input_size', len(tfidf_vectorizer.vocabulary_))
+        embedding_size = checkpoint.get('embedding_size', 512)
+        h1 = checkpoint.get('hidden1_size', 128)
+        h2 = checkpoint.get('hidden2_size', 64)
+        model_meta['pos_weight'] = checkpoint.get('pos_weight', 1.0)
+
+        # Initialize and load model
+        model = HateSpeechNN(input_size=input_size, embedding_size=embedding_size, h1=h1, h2=h2)
+        
+        try:
+            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        except RuntimeError as e:
+            print(f"Warning: {e}")
+            
+        model.to(device)
+        model.eval()
+
+        # 3. Load text processing components
+        text_processor_path = os.path.join(OUTPUT_DIR, 'text_processor.pkl')
+        with open(text_processor_path, 'rb') as f:
+            text_processor = pickle.load(f)
+            cleaning_components = {
+                'stemmer': text_processor['stemmer'],
+                'stop_words': text_processor['stop_words']
+            }
+
+        print("Model and artifacts loaded successfully!")
+        return True
+    except Exception as e:
+        print(f"Error loading artifacts: {e}")
+        return False
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -138,43 +132,54 @@ def predict():
         
         if not text:
             return jsonify({'error': 'No text provided'}), 400
+
+        if model is None or tfidf_vectorizer is None:
+            return jsonify({'error': 'Model or preprocessing artifacts not loaded on server'}), 503
         
         # 1. Clean text
         cleaned_text = clean_text(text)
         
-        # 2. Transform to TF-IDF
+        # 2. TF-IDF
         tfidf_vector = tfidf_vectorizer.transform([cleaned_text])
         
-        # 3. Convert to Tensor
-        # Dense array needed for NN input
+        # 3. Convert to tensor
         input_tensor = torch.tensor(tfidf_vector.toarray(), dtype=torch.float32).to(device)
         
         # 4. Predict
         with torch.no_grad():
             logits = model(input_tensor)
-            probability = torch.sigmoid(logits).item()
-        
-        prediction = 1 if probability > 0.5 else 0
-        
+            prob_non_hate = float(torch.sigmoid(logits).item())
+
+        prob_hate = 1.0 - prob_non_hate
+
+        if prob_hate >= 0.5:
+            prediction = 0
+            label = "Hate"
+            confidence = prob_hate
+        else:
+            prediction = 1
+            label = "Non-Hate"
+            confidence = prob_non_hate
+
         response = {
             'text': text,
             'cleaned_text': cleaned_text,
             'prediction': int(prediction),
-            'label': 'Hate Speech' if prediction == 1 else 'Non-Hate Speech',
-            'confidence': float(probability) if prediction == 1 else float(1 - probability),
-            'probability_hate': float(probability),
-            'probability_non_hate': float(1 - probability),
+            'label': label,
+            'confidence': float(confidence),
+            'probability_hate': prob_hate,
+            'probability_non_hate': prob_non_hate,
             'timestamp': datetime.now().isoformat()
         }
         
         return jsonify(response)
     
     except Exception as e:
+        print(f"Error in prediction: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/feedback', methods=['POST'])
 def submit_feedback():
-    """Submit user feedback."""
     try:
         data = request.json
         text = data.get('text', '')
@@ -185,12 +190,13 @@ def submit_feedback():
         
         cleaned_text = clean_text(text)
         
+        
         feedback_entry = {
             'timestamp': datetime.now().isoformat(),
             'original_text': text,
             'cleaned_text': cleaned_text,
-            'true_label': true_label,
-            'used_for_training': False
+            'used_for_training': False,
+            'true_label': true_label
         }
         
         df_feedback = pd.DataFrame([feedback_entry])
@@ -205,25 +211,7 @@ def submit_feedback():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/stats', methods=['GET'])
-def get_stats():
-    try:
-        if not os.path.exists(FEEDBACK_FILE):
-            return jsonify({'message': 'No feedback data available yet'})
-        
-        df = pd.read_csv(FEEDBACK_FILE)
-        unused = df[df['used_for_training'] == False]
-        
-        return jsonify({
-            'total_feedback': len(df),
-            'unused_feedback': len(unused),
-            'hate_count': int(df['true_label'].sum()) if len(df) > 0 else 0
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
 def periodic_retrain():
-    """Background thread for fine-tuning the PyTorch model."""
     while True:
         time.sleep(RETRAIN_INTERVAL)
         try:
@@ -240,7 +228,6 @@ def periodic_retrain():
             print(f"Error in retraining thread: {e}")
 
 def retrain_model(new_data):
-    """Fine-tune the PyTorch model."""
     global model
     
     try:
@@ -254,7 +241,7 @@ def retrain_model(new_data):
         loader = DataLoader(dataset, batch_size=16, shuffle=True)
         
         # Setup Training
-        model.train() # Set to train mode
+        model.train()
         criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(model_meta['pos_weight']).to(device))
         optimizer = torch.optim.Adam(model.parameters(), lr=0.0001) # Low LR for fine-tuning
         
@@ -291,10 +278,10 @@ def retrain_model(new_data):
         
     except Exception as e:
         print(f"Error during retraining: {e}")
-        model.eval() # Ensure model goes back to eval mode even if error
+        model.eval()
 
 if __name__ == '__main__':
-    load_model_and_artifacts()
+    load()
     
     retrain_thread = threading.Thread(target=periodic_retrain, daemon=True)
     retrain_thread.start()
